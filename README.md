@@ -54,11 +54,17 @@ Or per-host in `~/.ssh/config`:
 Host github.com
     SecurityKeyProvider /usr/local/lib/libyubikey-sk.dylib
     IdentityFile ~/.ssh/id_ed25519_sk
-    IdentityAgent none
 ```
 
-> **Note:** `IdentityAgent none` is required because Apple's built-in ssh-agent
-> does not support SK operations. This tells SSH to talk to the YubiKey directly.
+### Adding SK keys to ssh-agent
+
+Apple's built-in ssh-agent supports loading SK keys via a provider library:
+
+```sh
+ssh-add -S /usr/local/lib/libyubikey-sk.dylib ~/.ssh/id_ed25519_sk
+```
+
+This registers the key with the agent so subsequent SSH connections use it automatically.
 
 ### Generate a FIDO2 SSH key
 
