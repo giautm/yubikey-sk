@@ -121,31 +121,9 @@ ssh_to_cose_alg(uint32_t alg)
 	}
 }
 
-/* Pack an EC256 public key into the wire format expected by OpenSSH */
+/* Pack credential public key into the wire format expected by OpenSSH */
 static int
-pack_es256_pubkey(const fido_cred_t *cred, struct sk_enroll_response *resp)
-{
-	const uint8_t *pk;
-	size_t pk_len;
-
-	if ((pk = fido_cred_pubkey_ptr(cred)) == NULL) {
-		skdebug(__func__, "fido_cred_pubkey_ptr failed");
-		return -1;
-	}
-	pk_len = fido_cred_pubkey_len(cred);
-
-	if ((resp->public_key = malloc(pk_len)) == NULL) {
-		skdebug(__func__, "malloc public_key failed");
-		return -1;
-	}
-	memcpy(resp->public_key, pk, pk_len);
-	resp->public_key_len = pk_len;
-	return 0;
-}
-
-/* Pack an ED25519 public key into the wire format expected by OpenSSH */
-static int
-pack_ed25519_pubkey(const fido_cred_t *cred, struct sk_enroll_response *resp)
+pack_pubkey(const fido_cred_t *cred, struct sk_enroll_response *resp)
 {
 	const uint8_t *pk;
 	size_t pk_len;
@@ -282,16 +260,8 @@ sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
 	}
 
 	/* Extract public key */
-	switch (alg) {
-	case SSH_SK_ECDSA:
-		if (pack_es256_pubkey(cred, resp) != 0)
-			goto out;
-		break;
-	case SSH_SK_ED25519:
-		if (pack_ed25519_pubkey(cred, resp) != 0)
-			goto out;
-		break;
-	}
+	if (pack_pubkey(cred, resp) != 0)
+		goto out;
 
 	/* Extract key handle (credential ID) */
 	if ((id = fido_cred_id_ptr(cred)) == NULL ||
@@ -372,7 +342,6 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 	struct sk_sign_response *resp = NULL;
 	const uint8_t *sig;
 	size_t sig_len;
-	int cose_alg;
 	int r, ret = SSH_SK_ERR_GENERAL;
 
 	skdebug(__func__, "sign alg=%u application=%s flags=0x%02x",
@@ -391,11 +360,6 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 
 	if (check_alg_support(alg) != 0) {
 		skdebug(__func__, "unsupported algorithm %u", alg);
-		return SSH_SK_ERR_UNSUPPORTED;
-	}
-
-	if ((cose_alg = ssh_to_cose_alg(alg)) == -1) {
-		skdebug(__func__, "failed to map algorithm");
 		return SSH_SK_ERR_UNSUPPORTED;
 	}
 
