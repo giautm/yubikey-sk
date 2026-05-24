@@ -1,20 +1,32 @@
 # yubikey-sk
 
-A FIDO2 Security Key provider library for Apple's OpenSSH. This bridges OpenSSH's `SSH_SK_PROVIDER` interface to YubiKey hardware tokens via `libfido2`.
+A FIDO2 Security Key provider library for Apple's OpenSSH on macOS.
+
+Apple's macOS ships with OpenSSH but does not include a built-in SK (Security Key) middleware for hardware tokens. This library bridges OpenSSH's `SSH_SK_PROVIDER` interface to YubiKey hardware tokens via [libfido2](https://github.com/Yubico/libfido2), enabling `ed25519-sk` and `ecdsa-sk` key types.
+
+## Why?
+
+macOS's bundled OpenSSH supports FIDO2/U2F key types (`-sk` suffix) but:
+- Does **not** ship with a usable SK provider library
+- The built-in `ssh-agent` does **not** support SK provider loading
+- Apple's OpenSSH passes raw signing data (not pre-hashed), unlike upstream OpenSSH
+
+This library handles all of the above, letting you use your YubiKey for SSH authentication on macOS with zero hassle.
 
 ## Requirements
 
-- macOS with OpenSSH 8.2+ (ships with macOS)
+- macOS 13+ with OpenSSH 9.0+ (ships with macOS)
 - [libfido2](https://github.com/Yubico/libfido2) — `brew install libfido2`
 - A YubiKey with FIDO2 support (YubiKey 5 series, Security Key series)
 
 ## Build
 
 ```sh
+brew install libfido2
 make
 ```
 
-For debug output:
+For a debug build (always prints diagnostics to stderr):
 ```sh
 make debug
 ```
@@ -22,69 +34,95 @@ make debug
 ## Install
 
 ```sh
-make install          # installs to /usr/local/lib
-# or
-make install PREFIX=$HOME/.local
+make install                    # installs to /usr/local/lib
+make install PREFIX=$HOME/.local  # or a custom prefix
 ```
 
 ## Usage
 
-Set the `SSH_SK_PROVIDER` environment variable to point to the library:
+### Configuration
+
+Add to your shell profile (`~/.zshrc`):
 
 ```sh
-export SSH_SK_PROVIDER=/path/to/libyubikey-sk.dylib
+export SSH_SK_PROVIDER=/usr/local/lib/libyubikey-sk.dylib
 ```
 
-Or add to your `~/.ssh/config`:
+Or per-host in `~/.ssh/config`:
 
 ```
-SecurityKeyProvider /path/to/libyubikey-sk.dylib
+Host github.com
+    SecurityKeyProvider /usr/local/lib/libyubikey-sk.dylib
+    IdentityFile ~/.ssh/id_ed25519_sk
+    IdentityAgent none
 ```
 
-### Generate a FIDO2 SSH key (stored on YubiKey)
+> **Note:** `IdentityAgent none` is required because Apple's built-in ssh-agent
+> does not support SK operations. This tells SSH to talk to the YubiKey directly.
+
+### Generate a FIDO2 SSH key
 
 ```sh
+# ED25519-SK (recommended)
+ssh-keygen -t ed25519-sk
+
 # ECDSA-SK
 ssh-keygen -t ecdsa-sk
 
-# ED25519-SK
-ssh-keygen -t ed25519-sk
-
-# Resident key (discoverable, stored on YubiKey)
+# Resident key (discoverable credential stored on YubiKey)
 ssh-keygen -t ed25519-sk -O resident
 ```
 
 ### Load resident keys from YubiKey
 
 ```sh
-ssh-add -K
-ssh-keygen -K   # download to ~/.ssh/
+ssh-keygen -K   # downloads discoverable keys to ~/.ssh/
 ```
 
 ### Authenticate
 
 ```sh
-ssh user@host   # will blink YubiKey for touch confirmation
+ssh user@host   # YubiKey will blink — tap to confirm
 ```
 
-### Debug
+### Troubleshooting
 
 Enable debug logging:
 ```sh
 export YUBIKEY_SK_DEBUG=1
-ssh user@host
+ssh -v user@host
 ```
 
 ## How it works
 
-OpenSSH loads this shared library at runtime and calls:
+OpenSSH loads this shared library (`.dylib`) at runtime via `dlopen` and calls the SK middleware API:
 
-- `sk_api_version()` — returns API version compatibility
-- `sk_enroll()` — generates a new FIDO2 credential on the YubiKey
-- `sk_sign()` — performs a FIDO2 assertion (signs a challenge)
-- `sk_load_resident_keys()` — enumerates discoverable credentials
+| Function | Purpose |
+|----------|---------|
+| `sk_api_version()` | Returns API version (0x000a0000) |
+| `sk_enroll()` | Generates a new FIDO2 credential on the YubiKey |
+| `sk_sign()` | Performs a FIDO2 assertion (signs a challenge) |
+| `sk_load_resident_keys()` | Enumerates discoverable credentials |
 
-The library uses `libfido2` to communicate with the YubiKey over USB HID.
+The library uses `libfido2` to communicate with the YubiKey over USB HID (via macOS IOKit).
+
+### Apple OpenSSH compatibility
+
+Apple's OpenSSH diverges from upstream in how it calls `sk_sign()` — it passes the full signing data (not a pre-computed SHA-256 hash). This library detects the data length and handles both cases transparently.
+
+## Supported hardware
+
+- YubiKey 5 series (USB-A, USB-C, NFC)
+- YubiKey 5 FIPS series
+- Security Key by Yubico (USB-A, NFC)
+- Any FIDO2-compliant key accessible via libfido2
+
+## Contributing
+
+1. Fork the repo
+2. Create a feature branch
+3. Make your changes (run `make debug` to test)
+4. Submit a pull request
 
 ## License
 
