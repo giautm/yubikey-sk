@@ -78,6 +78,22 @@ out:
 	return dev;
 }
 
+/* Check for unsupported required options */
+static int
+check_options(struct sk_option **options)
+{
+	if (options == NULL)
+		return 0;
+	for (size_t i = 0; options[i] != NULL; i++) {
+		if (options[i]->required) {
+			skdebug(__func__, "unsupported required option: %s",
+			    options[i]->name);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /* Check if a device supports the given algorithm */
 static int
 check_alg_support(uint32_t alg)
@@ -170,8 +186,6 @@ sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
 	int cose_alg;
 	int r, ret = SSH_SK_ERR_GENERAL;
 
-	(void)options; /* unused for now */
-
 	skdebug(__func__, "enroll alg=%u application=%s flags=0x%02x",
 	    alg, application ? application : "(null)", flags);
 
@@ -179,6 +193,9 @@ sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
 		skdebug(__func__, "enroll_response is NULL");
 		return SSH_SK_ERR_GENERAL;
 	}
+
+	if (check_options(options) != 0)
+		return SSH_SK_ERR_UNSUPPORTED;
 	*enroll_response = NULL;
 
 	if (check_alg_support(alg) != 0) {
@@ -358,8 +375,6 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 	int cose_alg;
 	int r, ret = SSH_SK_ERR_GENERAL;
 
-	(void)options;
-
 	skdebug(__func__, "sign alg=%u application=%s flags=0x%02x",
 	    alg, application ? application : "(null)", flags);
 	skdebug(__func__, "data_len=%zu key_handle_len=%zu",
@@ -369,6 +384,9 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 		skdebug(__func__, "sign_response is NULL");
 		return SSH_SK_ERR_GENERAL;
 	}
+
+	if (check_options(options) != 0)
+		return SSH_SK_ERR_UNSUPPORTED;
 	*sign_response = NULL;
 
 	if (check_alg_support(alg) != 0) {
@@ -472,33 +490,45 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 		 * For ECDSA, the signature is a DER-encoded SEQUENCE of two INTEGERs
 		 * (r, s). We need to extract them for OpenSSH.
 		 */
-		/* Parse DER SEQUENCE */
 		const uint8_t *p = sig;
 		size_t remaining = sig_len;
+		size_t seq_hdr_len;
 
+		/* Validate SEQUENCE tag */
 		if (remaining < 2 || p[0] != 0x30) {
 			skdebug(__func__, "invalid DER signature");
 			goto out;
 		}
-		p += 2; /* skip SEQUENCE tag and length */
-		remaining -= 2;
-		/* Handle multi-byte length */
+
+		/* Parse SEQUENCE length (handle multi-byte) */
 		if (sig[1] & 0x80) {
 			size_t len_bytes = sig[1] & 0x7f;
-			p = sig + 2 + len_bytes;
-			remaining = sig_len - 2 - len_bytes;
+			if (len_bytes == 0 || len_bytes > 2 ||
+			    2 + len_bytes > sig_len) {
+				skdebug(__func__, "invalid DER sequence length");
+				goto out;
+			}
+			seq_hdr_len = 2 + len_bytes;
+		} else {
+			seq_hdr_len = 2;
 		}
+		p += seq_hdr_len;
+		remaining = sig_len - seq_hdr_len;
 
-		/* Extract r */
+		/* Extract r INTEGER */
 		if (remaining < 2 || p[0] != 0x02) {
 			skdebug(__func__, "invalid DER integer (r)");
+			goto out;
+		}
+		if (p[1] & 0x80) {
+			skdebug(__func__, "multi-byte integer length unsupported");
 			goto out;
 		}
 		size_t r_len = p[1];
 		p += 2;
 		remaining -= 2;
-		if (r_len > remaining) {
-			skdebug(__func__, "r_len overflow");
+		if (r_len == 0 || r_len > remaining || r_len > 33) {
+			skdebug(__func__, "invalid r_len %zu", r_len);
 			goto out;
 		}
 		if ((resp->sig_r = malloc(r_len)) == NULL) {
@@ -510,16 +540,20 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 		p += r_len;
 		remaining -= r_len;
 
-		/* Extract s */
+		/* Extract s INTEGER */
 		if (remaining < 2 || p[0] != 0x02) {
 			skdebug(__func__, "invalid DER integer (s)");
+			goto out;
+		}
+		if (p[1] & 0x80) {
+			skdebug(__func__, "multi-byte integer length unsupported");
 			goto out;
 		}
 		size_t s_len = p[1];
 		p += 2;
 		remaining -= 2;
-		if (s_len > remaining) {
-			skdebug(__func__, "s_len overflow");
+		if (s_len == 0 || s_len > remaining || s_len > 33) {
+			skdebug(__func__, "invalid s_len %zu", s_len);
 			goto out;
 		}
 		if ((resp->sig_s = malloc(s_len)) == NULL) {
@@ -571,14 +605,15 @@ sk_load_resident_keys(const char *pin, struct sk_option **options,
 	size_t nkeys = 0;
 	int r, ret = SSH_SK_ERR_GENERAL;
 
-	(void)options;
-
 	skdebug(__func__, "loading resident keys");
 
 	if (rks == NULL || nrks == NULL) {
 		skdebug(__func__, "rks or nrks is NULL");
 		return SSH_SK_ERR_GENERAL;
 	}
+
+	if (check_options(options) != 0)
+		return SSH_SK_ERR_UNSUPPORTED;
 	*rks = NULL;
 	*nrks = 0;
 
@@ -638,9 +673,6 @@ sk_load_resident_keys(const char *pin, struct sk_option **options,
 			skdebug(__func__, "fido_credman_rk_new failed");
 			goto out;
 		}
-
-		const uint8_t *rp_id_hash = fido_credman_rp_id_hash_ptr(rp, i);
-		size_t rp_id_hash_len = fido_credman_rp_id_hash_len(rp, i);
 
 		if ((r = fido_credman_get_dev_rk(dev, rp_id, rk, pin)) != FIDO_OK) {
 			skdebug(__func__, "fido_credman_get_dev_rk: %s", fido_strerr(r));
@@ -730,8 +762,6 @@ sk_load_resident_keys(const char *pin, struct sk_option **options,
 			}
 
 			keys[nkeys++] = srk;
-			(void)rp_id_hash;
-			(void)rp_id_hash_len;
 		}
 		fido_credman_rk_free(&rk);
 		rk = NULL;
