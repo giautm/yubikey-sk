@@ -81,7 +81,7 @@ open_first_device(void)
 	}
 
 out:
-	fido_dev_info_free(&devlist, ndevs);
+	fido_dev_info_free(&devlist, MAX_FIDO_DEVICES);
 	return dev;
 }
 
@@ -191,7 +191,7 @@ find_device_for_cred(const uint8_t *message, size_t message_len,
 	}
 
 out:
-	fido_dev_info_free(&devlist, ndevs);
+	fido_dev_info_free(&devlist, MAX_FIDO_DEVICES);
 	return dev;
 }
 
@@ -863,17 +863,12 @@ sk_load_resident_keys(const char *pin, struct sk_option **options,
 				goto out;
 			}
 
-			/* Copy public key */
-			const uint8_t *pk = fido_cred_pubkey_ptr(cred);
-			size_t pk_len = fido_cred_pubkey_len(cred);
-			if (pk != NULL && pk_len > 0) {
-				if ((srk->key.public_key = malloc(pk_len)) == NULL) {
-					free(srk->application);
-					free(srk);
-					goto out;
-				}
-				memcpy(srk->key.public_key, pk, pk_len);
-				srk->key.public_key_len = pk_len;
+			/* Pack public key in the format OpenSSH expects */
+			if (pack_public_key(ssh_alg, cred, &srk->key) != 0) {
+				skdebug(__func__, "pack_public_key failed");
+				free(srk->application);
+				free(srk);
+				continue;
 			}
 
 			/* Copy key handle (credential ID) */
