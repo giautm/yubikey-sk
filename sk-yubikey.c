@@ -16,6 +16,11 @@
 #include <fido/es256.h>
 #include <fido/eddsa.h>
 
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/obj_mac.h>
+
 #include "sk-api.h"
 
 /* Debug logging - set YUBIKEY_SK_DEBUG=1 to enable */
@@ -29,9 +34,11 @@
 } while(0)
 #endif
 
-/* Find the first FIDO device available */
+#define MAX_FIDO_DEVICES 64
+
+/* Find the first FIDO device available (for enroll/resident keys) */
 static fido_dev_t *
-open_device(void)
+open_first_device(void)
 {
 	fido_dev_info_t *devlist = NULL;
 	const fido_dev_info_t *di;
@@ -39,11 +46,11 @@ open_device(void)
 	size_t ndevs = 0;
 	int r;
 
-	if ((devlist = fido_dev_info_new(64)) == NULL) {
+	if ((devlist = fido_dev_info_new(MAX_FIDO_DEVICES)) == NULL) {
 		skdebug(__func__, "fido_dev_info_new failed");
 		goto out;
 	}
-	if ((r = fido_dev_info_manifest(devlist, 64, &ndevs)) != FIDO_OK) {
+	if ((r = fido_dev_info_manifest(devlist, MAX_FIDO_DEVICES, &ndevs)) != FIDO_OK) {
 		skdebug(__func__, "fido_dev_info_manifest: %s", fido_strerr(r));
 		goto out;
 	}
@@ -71,6 +78,116 @@ open_device(void)
 		fido_dev_free(&dev);
 		dev = NULL;
 		goto out;
+	}
+
+out:
+	fido_dev_info_free(&devlist, ndevs);
+	return dev;
+}
+
+/*
+ * Test if a device holds the specified credential by attempting a
+ * silent assertion (no user presence required).
+ */
+static int
+try_device(fido_dev_t *dev, const uint8_t *message, size_t message_len,
+    const char *application, const uint8_t *key_handle, size_t key_handle_len)
+{
+	fido_assert_t *assert = NULL;
+	int r = FIDO_ERR_INTERNAL;
+
+	if ((assert = fido_assert_new()) == NULL) {
+		skdebug(__func__, "fido_assert_new failed");
+		goto out;
+	}
+	if ((r = fido_assert_set_clientdata_hash(assert, message,
+	    message_len)) != FIDO_OK) {
+		skdebug(__func__, "fido_assert_set_clientdata_hash: %s",
+		    fido_strerr(r));
+		goto out;
+	}
+	if ((r = fido_assert_set_rp(assert, application)) != FIDO_OK) {
+		skdebug(__func__, "fido_assert_set_rp: %s", fido_strerr(r));
+		goto out;
+	}
+	if ((r = fido_assert_allow_cred(assert, key_handle,
+	    key_handle_len)) != FIDO_OK) {
+		skdebug(__func__, "fido_assert_allow_cred: %s",
+		    fido_strerr(r));
+		goto out;
+	}
+	if ((r = fido_assert_set_up(assert, FIDO_OPT_FALSE)) != FIDO_OK) {
+		skdebug(__func__, "fido_assert_set_up: %s", fido_strerr(r));
+		goto out;
+	}
+	r = fido_dev_get_assert(dev, assert, NULL);
+	skdebug(__func__, "fido_dev_get_assert: %s", fido_strerr(r));
+	if (r == FIDO_ERR_USER_PRESENCE_REQUIRED) {
+		/* U2F tokens may return this */
+		r = FIDO_OK;
+	}
+out:
+	fido_assert_free(&assert);
+	return r != FIDO_OK ? -1 : 0;
+}
+
+/*
+ * Iterate over all FIDO devices looking for the one holding the
+ * specified credential. Uses a dummy hash for the probe.
+ */
+static fido_dev_t *
+find_device_for_cred(const uint8_t *message, size_t message_len,
+    const char *application, const uint8_t *key_handle, size_t key_handle_len)
+{
+	fido_dev_info_t *devlist = NULL;
+	fido_dev_t *dev = NULL;
+	size_t ndevs = 0;
+	int r;
+
+	if ((devlist = fido_dev_info_new(MAX_FIDO_DEVICES)) == NULL) {
+		skdebug(__func__, "fido_dev_info_new failed");
+		goto out;
+	}
+	if ((r = fido_dev_info_manifest(devlist, MAX_FIDO_DEVICES, &ndevs)) != FIDO_OK) {
+		skdebug(__func__, "fido_dev_info_manifest: %s", fido_strerr(r));
+		goto out;
+	}
+	if (ndevs == 0) {
+		skdebug(__func__, "no FIDO devices found");
+		goto out;
+	}
+
+	skdebug(__func__, "found %zu device(s)", ndevs);
+
+	for (size_t i = 0; i < ndevs; i++) {
+		const fido_dev_info_t *di = fido_dev_info_ptr(devlist, i);
+		const char *path;
+
+		if (di == NULL)
+			continue;
+		if ((path = fido_dev_info_path(di)) == NULL)
+			continue;
+
+		skdebug(__func__, "trying device %zu: %s", i, path);
+
+		if ((dev = fido_dev_new()) == NULL) {
+			skdebug(__func__, "fido_dev_new failed");
+			continue;
+		}
+		if ((r = fido_dev_open(dev, path)) != FIDO_OK) {
+			skdebug(__func__, "fido_dev_open: %s", fido_strerr(r));
+			fido_dev_free(&dev);
+			dev = NULL;
+			continue;
+		}
+		if (try_device(dev, message, message_len,
+		    application, key_handle, key_handle_len) == 0) {
+			skdebug(__func__, "found key on device %s", path);
+			break;
+		}
+		fido_dev_close(dev);
+		fido_dev_free(&dev);
+		dev = NULL;
 	}
 
 out:
@@ -121,26 +238,113 @@ ssh_to_cose_alg(uint32_t alg)
 	}
 }
 
-/* Pack credential public key into the wire format expected by OpenSSH */
+/*
+ * The key returned via fido_cred_pubkey_ptr() for ES256 is in affine
+ * coordinates (64 bytes: x || y), but OpenSSH expects SEC1 uncompressed
+ * point format (65 bytes: 0x04 || x || y).
+ */
 static int
-pack_pubkey(const fido_cred_t *cred, struct sk_enroll_response *resp)
+pack_public_key_ecdsa(const fido_cred_t *cred, struct sk_enroll_response *resp)
 {
-	const uint8_t *pk;
-	size_t pk_len;
+	const uint8_t *ptr;
+	BIGNUM *x = NULL, *y = NULL;
+	EC_POINT *q = NULL;
+	EC_GROUP *g = NULL;
+	int ret = -1;
 
-	if ((pk = fido_cred_pubkey_ptr(cred)) == NULL) {
+	resp->public_key = NULL;
+	resp->public_key_len = 0;
+
+	if ((ptr = fido_cred_pubkey_ptr(cred)) == NULL) {
+		skdebug(__func__, "fido_cred_pubkey_ptr failed");
+		goto out;
+	}
+	if (fido_cred_pubkey_len(cred) != 64) {
+		skdebug(__func__, "bad fido_cred_pubkey_len %zu",
+		    fido_cred_pubkey_len(cred));
+		goto out;
+	}
+
+	if ((x = BN_new()) == NULL ||
+	    (y = BN_new()) == NULL ||
+	    (g = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1)) == NULL ||
+	    (q = EC_POINT_new(g)) == NULL) {
+		skdebug(__func__, "libcrypto setup failed");
+		goto out;
+	}
+	if (BN_bin2bn(ptr, 32, x) == NULL ||
+	    BN_bin2bn(ptr + 32, 32, y) == NULL) {
+		skdebug(__func__, "BN_bin2bn failed");
+		goto out;
+	}
+	if (EC_POINT_set_affine_coordinates(g, q, x, y, NULL) != 1) {
+		skdebug(__func__, "EC_POINT_set_affine_coordinates failed");
+		goto out;
+	}
+	resp->public_key_len = EC_POINT_point2oct(g, q,
+	    POINT_CONVERSION_UNCOMPRESSED, NULL, 0, NULL);
+	if (resp->public_key_len == 0 || resp->public_key_len > 2048) {
+		skdebug(__func__, "bad pubkey length %zu", resp->public_key_len);
+		goto out;
+	}
+	if ((resp->public_key = malloc(resp->public_key_len)) == NULL) {
+		skdebug(__func__, "malloc pubkey failed");
+		goto out;
+	}
+	if (EC_POINT_point2oct(g, q, POINT_CONVERSION_UNCOMPRESSED,
+	    resp->public_key, resp->public_key_len, NULL) == 0) {
+		skdebug(__func__, "EC_POINT_point2oct failed");
+		goto out;
+	}
+	ret = 0;
+out:
+	if (ret != 0) {
+		free(resp->public_key);
+		resp->public_key = NULL;
+		resp->public_key_len = 0;
+	}
+	EC_POINT_free(q);
+	EC_GROUP_free(g);
+	BN_clear_free(x);
+	BN_clear_free(y);
+	return ret;
+}
+
+static int
+pack_public_key_ed25519(const fido_cred_t *cred, struct sk_enroll_response *resp)
+{
+	const uint8_t *ptr;
+	size_t len;
+
+	if ((len = fido_cred_pubkey_len(cred)) != 32) {
+		skdebug(__func__, "bad fido_cred_pubkey_len %zu", len);
+		return -1;
+	}
+	if ((ptr = fido_cred_pubkey_ptr(cred)) == NULL) {
 		skdebug(__func__, "fido_cred_pubkey_ptr failed");
 		return -1;
 	}
-	pk_len = fido_cred_pubkey_len(cred);
-
-	if ((resp->public_key = malloc(pk_len)) == NULL) {
-		skdebug(__func__, "malloc public_key failed");
+	if ((resp->public_key = malloc(len)) == NULL) {
+		skdebug(__func__, "malloc pubkey failed");
 		return -1;
 	}
-	memcpy(resp->public_key, pk, pk_len);
-	resp->public_key_len = pk_len;
+	memcpy(resp->public_key, ptr, len);
+	resp->public_key_len = len;
 	return 0;
+}
+
+static int
+pack_public_key(uint32_t alg, const fido_cred_t *cred,
+    struct sk_enroll_response *resp)
+{
+	switch (alg) {
+	case SSH_SK_ECDSA:
+		return pack_public_key_ecdsa(cred, resp);
+	case SSH_SK_ED25519:
+		return pack_public_key_ed25519(cred, resp);
+	default:
+		return -1;
+	}
 }
 
 /* --- Public API --- */
@@ -186,7 +390,7 @@ sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
 		return SSH_SK_ERR_UNSUPPORTED;
 	}
 
-	if ((dev = open_device()) == NULL) {
+	if ((dev = open_first_device()) == NULL) {
 		skdebug(__func__, "failed to open device");
 		return SSH_SK_ERR_DEVICE_NOT_FOUND;
 	}
@@ -253,6 +457,21 @@ sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
 		goto out;
 	}
 
+	/* Verify the credential attestation */
+	if (fido_cred_x5c_ptr(cred) != NULL) {
+		if ((r = fido_cred_verify(cred)) != FIDO_OK) {
+			skdebug(__func__, "fido_cred_verify: %s", fido_strerr(r));
+			goto out;
+		}
+	} else {
+		skdebug(__func__, "self-attested credential");
+		if ((r = fido_cred_verify_self(cred)) != FIDO_OK) {
+			skdebug(__func__, "fido_cred_verify_self: %s",
+			    fido_strerr(r));
+			goto out;
+		}
+	}
+
 	/* Allocate response */
 	if ((resp = calloc(1, sizeof(*resp))) == NULL) {
 		skdebug(__func__, "calloc response failed");
@@ -260,7 +479,7 @@ sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
 	}
 
 	/* Extract public key */
-	if (pack_pubkey(cred, resp) != 0)
+	if (pack_public_key(alg, cred, resp) != 0)
 		goto out;
 
 	/* Extract key handle (credential ID) */
@@ -363,8 +582,18 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 		return SSH_SK_ERR_UNSUPPORTED;
 	}
 
-	if ((dev = open_device()) == NULL) {
-		skdebug(__func__, "failed to open device");
+	/*
+	 * Find the device holding this credential by probing all devices.
+	 * Use a dummy 32-byte hash for the probe (actual signing uses real data).
+	 */
+	{
+		uint8_t dummy_hash[32];
+		memset(dummy_hash, 0, sizeof(dummy_hash));
+		dev = find_device_for_cred(dummy_hash, sizeof(dummy_hash),
+		    application, key_handle, key_handle_len);
+	}
+	if (dev == NULL) {
+		skdebug(__func__, "failed to find device for credential");
 		return SSH_SK_ERR_DEVICE_NOT_FOUND;
 	}
 
@@ -451,90 +680,41 @@ sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
 
 	if (alg == SSH_SK_ECDSA) {
 		/*
-		 * For ECDSA, the signature is a DER-encoded SEQUENCE of two INTEGERs
-		 * (r, s). We need to extract them for OpenSSH.
+		 * For ECDSA, the signature is DER-encoded. Use OpenSSL to
+		 * parse it properly and extract r, s as big-endian integers.
 		 */
-		const uint8_t *p = sig;
-		size_t remaining = sig_len;
-		size_t seq_hdr_len;
+		ECDSA_SIG *esig = NULL;
+		const BIGNUM *sig_r, *sig_s;
+		const unsigned char *cp = sig;
 
-		/* Validate SEQUENCE tag */
-		if (remaining < 2 || p[0] != 0x30) {
-			skdebug(__func__, "invalid DER signature");
+		if ((esig = d2i_ECDSA_SIG(NULL, &cp, (long)sig_len)) == NULL) {
+			skdebug(__func__, "d2i_ECDSA_SIG failed");
 			goto out;
 		}
-
-		/* Parse SEQUENCE length (handle multi-byte) */
-		if (sig[1] & 0x80) {
-			size_t len_bytes = sig[1] & 0x7f;
-			if (len_bytes == 0 || len_bytes > 2 ||
-			    2 + len_bytes > sig_len) {
-				skdebug(__func__, "invalid DER sequence length");
-				goto out;
-			}
-			seq_hdr_len = 2 + len_bytes;
-		} else {
-			seq_hdr_len = 2;
-		}
-		p += seq_hdr_len;
-		remaining = sig_len - seq_hdr_len;
-
-		/* Extract r INTEGER */
-		if (remaining < 2 || p[0] != 0x02) {
-			skdebug(__func__, "invalid DER integer (r)");
+		ECDSA_SIG_get0(esig, &sig_r, &sig_s);
+		resp->sig_r_len = BN_num_bytes(sig_r);
+		resp->sig_s_len = BN_num_bytes(sig_s);
+		if ((resp->sig_r = calloc(1, resp->sig_r_len)) == NULL ||
+		    (resp->sig_s = calloc(1, resp->sig_s_len)) == NULL) {
+			skdebug(__func__, "calloc signature failed");
+			ECDSA_SIG_free(esig);
 			goto out;
 		}
-		if (p[1] & 0x80) {
-			skdebug(__func__, "multi-byte integer length unsupported");
-			goto out;
-		}
-		size_t r_len = p[1];
-		p += 2;
-		remaining -= 2;
-		if (r_len == 0 || r_len > remaining || r_len > 33) {
-			skdebug(__func__, "invalid r_len %zu", r_len);
-			goto out;
-		}
-		if ((resp->sig_r = malloc(r_len)) == NULL) {
-			skdebug(__func__, "malloc sig_r failed");
-			goto out;
-		}
-		memcpy(resp->sig_r, p, r_len);
-		resp->sig_r_len = r_len;
-		p += r_len;
-		remaining -= r_len;
-
-		/* Extract s INTEGER */
-		if (remaining < 2 || p[0] != 0x02) {
-			skdebug(__func__, "invalid DER integer (s)");
-			goto out;
-		}
-		if (p[1] & 0x80) {
-			skdebug(__func__, "multi-byte integer length unsupported");
-			goto out;
-		}
-		size_t s_len = p[1];
-		p += 2;
-		remaining -= 2;
-		if (s_len == 0 || s_len > remaining || s_len > 33) {
-			skdebug(__func__, "invalid s_len %zu", s_len);
-			goto out;
-		}
-		if ((resp->sig_s = malloc(s_len)) == NULL) {
-			skdebug(__func__, "malloc sig_s failed");
-			goto out;
-		}
-		memcpy(resp->sig_s, p, s_len);
-		resp->sig_s_len = s_len;
+		BN_bn2bin(sig_r, resp->sig_r);
+		BN_bn2bin(sig_s, resp->sig_s);
+		ECDSA_SIG_free(esig);
 	} else if (alg == SSH_SK_ED25519) {
 		/* ED25519 signature is raw 64 bytes, store in sig_r */
-		if ((resp->sig_r = malloc(sig_len)) == NULL) {
-			skdebug(__func__, "malloc sig_r failed");
+		if (sig_len != 64) {
+			skdebug(__func__, "bad ed25519 sig len %zu", sig_len);
+			goto out;
+		}
+		if ((resp->sig_r = calloc(1, sig_len)) == NULL) {
+			skdebug(__func__, "calloc sig_r failed");
 			goto out;
 		}
 		memcpy(resp->sig_r, sig, sig_len);
 		resp->sig_r_len = sig_len;
-		/* sig_s is unused for ED25519 */
 		resp->sig_s = NULL;
 		resp->sig_s_len = 0;
 	}
@@ -581,7 +761,7 @@ sk_load_resident_keys(const char *pin, struct sk_option **options,
 	*rks = NULL;
 	*nrks = 0;
 
-	if ((dev = open_device()) == NULL) {
+	if ((dev = open_first_device()) == NULL) {
 		skdebug(__func__, "failed to open device");
 		return SSH_SK_ERR_DEVICE_NOT_FOUND;
 	}
